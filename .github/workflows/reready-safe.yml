@@ -1,0 +1,112 @@
+name: ReReady safe unauth probe
+
+on:
+  push:
+    paths:
+      - ".github/workflows/reready-safe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run low-rate sandbox checks
+        shell: python
+        run: |
+          import json, ssl, time, urllib.request, urllib.error
+          from urllib.parse import urlencode
+
+          BASE = "https://sandbox.reready.co"
+          UA = "AviVolah-ReReady-BugBounty/1.0 responsible-sandbox-testing"
+          out = {"target": BASE, "checks": []}
+
+          def req(path, method="GET", headers=None, max_body=4096):
+              url = BASE + path
+              h = {"User-Agent": UA, "Accept": "*/*"}
+              if headers:
+                  h.update(headers)
+              r = urllib.request.Request(url, method=method, headers=h)
+              try:
+                  with urllib.request.urlopen(r, timeout=15, context=ssl.create_default_context()) as resp:
+                      body = resp.read(max_body).decode("utf-8", "replace")
+                      return {
+                          "path": path,
+                          "method": method,
+                          "status": resp.status,
+                          "final_url": resp.geturl(),
+                          "headers": dict(resp.headers.items()),
+                          "body_sample": body,
+                      }
+              except urllib.error.HTTPError as e:
+                  body = e.read(max_body).decode("utf-8", "replace")
+                  return {
+                      "path": path,
+                      "method": method,
+                      "status": e.code,
+                      "final_url": e.geturl(),
+                      "headers": dict(e.headers.items()),
+                      "body_sample": body,
+                  }
+              except Exception as e:
+                  return {"path": path, "method": method, "error": repr(e)}
+
+          # Very small, non-destructive unauthenticated surface.
+          paths = [
+              "/",
+              "/users/sign_in",
+              "/users/sign_up",
+              "/robots.txt",
+              "/api/v1/device_transfers",
+              "/api/v1/shipments",
+              "/api/v1/users",
+              "/api/v1/organizations",
+          ]
+
+          for p in paths:
+              out["checks"].append(req(p))
+              time.sleep(1.0)
+
+          # CORS preflight against one documented API family.
+          out["checks"].append(req(
+              "/api/v1/device_transfers",
+              method="OPTIONS",
+              headers={
+                  "Origin": "https://example.com",
+                  "Access-Control-Request-Method": "GET",
+                  "Access-Control-Request-Headers": "authorization",
+              },
+          ))
+          time.sleep(1.0)
+
+          # Safe open-redirect probes; do not follow redirects off sandbox.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirect)
+          for key in ("next", "return_to", "redirect_to"):
+              path = "/users/sign_in?" + urlencode({key: "https://example.com"})
+              r = urllib.request.Request(BASE + path, headers={"User-Agent": UA})
+              try:
+                  with opener.open(r, timeout=15) as resp:
+                      data = {
+                          "path": path, "method": "GET", "status": resp.status,
+                          "headers": dict(resp.headers.items()),
+                          "body_sample": resp.read(2048).decode("utf-8", "replace"),
+                      }
+              except urllib.error.HTTPError as e:
+                  data = {
+                      "path": path, "method": "GET", "status": e.code,
+                      "headers": dict(e.headers.items()),
+                      "body_sample": e.read(2048).decode("utf-8", "replace"),
+                  }
+              except Exception as e:
+                  data = {"path": path, "method": "GET", "error": repr(e)}
+              out["checks"].append(data)
+              time.sleep(1.0)
+
+          print(json.dumps(out, indent=2))
