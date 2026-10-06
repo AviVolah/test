@@ -1,3 +1,4 @@
+# second commit to trigger Actions after workflow installation
 name: ReReady safe unauth probe
 
 on:
